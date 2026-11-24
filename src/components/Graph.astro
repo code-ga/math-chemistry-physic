@@ -1,0 +1,255 @@
+---
+---
+
+<div>
+  <canvas width="400" height="300"></canvas>
+</div>
+<style></style>
+<script>
+  const canvas_element = document.querySelector("canvas");
+  if (!canvas_element) throw new Error("WTF why canvas is undefined");
+  class HighPerfMathGraph {
+    ctx: CanvasRenderingContext2D;
+    dpr: number;
+    scale: number;
+    offsetX: number;
+    offsetY: number;
+    isDragging: boolean;
+    lastPointer: { x: number; y: number; };
+    dirty: boolean;
+    functions: { fn: (x: number) => number; color: string; lineWidth: number }[];
+    width: number;
+    height: number;
+    constructor(public canvas: HTMLCanvasElement) {
+      this.canvas = canvas;
+      const canvas_ctx = canvas.getContext("2d", { alpha: false }); // Opaque canvas skips alpha compositing
+      if (!canvas_ctx)
+        throw new Error("WTF context is undefined although canvas is defined");
+      this.ctx = canvas_ctx;
+      this.dpr = window.devicePixelRatio || 1;
+
+      // Camera state: pixels per math unit & origin position in CSS pixels
+      this.scale = 60;
+      this.offsetX = 0;
+      this.offsetY = 0;
+      this.width = 0;
+      this.height = 0;
+
+      this.isDragging = false;
+      this.lastPointer = { x: 0, y: 0 };
+      this.dirty = true;
+      this.functions = [];
+
+      this.resize();
+      this.centerOrigin();
+      this.bindEvents();
+      this.loop();
+    }
+
+    addFunction(fn: (x: number) => number, color = "#2563eb", lineWidth = 2) {
+      this.functions.push({ fn, color, lineWidth });
+      this.dirty = true;
+    }
+
+    centerOrigin() {
+      const rect = this.canvas.getBoundingClientRect();
+      this.offsetX = rect.width / 2;
+      this.offsetY = rect.height / 2;
+      this.dirty = true;
+    }
+
+    resize() {
+      const rect = this.canvas.getBoundingClientRect();
+      this.width = rect.width;
+      this.height = rect.height;
+      this.canvas.width = Math.round(rect.width * this.dpr);
+      this.canvas.height = Math.round(rect.height * this.dpr);
+      this.ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
+      this.dirty = true;
+    }
+
+    // Coordinate transforms (Math <-> CSS Pixels)
+    toScreenX = (x:number) => x * this.scale + this.offsetX;
+    toScreenY = (y:number) => this.offsetY - y * this.scale;
+    toWorldX = (px:number) => (px - this.offsetX) / this.scale;
+    toWorldY = (py:number) => (this.offsetY - py) / this.scale;
+
+    bindEvents() {
+      window.addEventListener("resize", () => this.resize());
+
+      // 1. Cursor-anchored Zoom
+      this.canvas.addEventListener(
+        "wheel",
+        (e) => {
+          e.preventDefault();
+          const rect = this.canvas.getBoundingClientRect();
+          const mouseX = e.clientX - rect.left;
+          const mouseY = e.clientY - rect.top;
+
+          // World point under cursor before zoom
+          const wx = this.toWorldX(mouseX);
+          const wy = this.toWorldY(mouseY);
+
+          // Smooth exponential zoom
+          const zoomFactor = Math.exp(-e.deltaY * 0.0015);
+          this.scale = Math.min(Math.max(this.scale * zoomFactor, 1e-6), 1e8);
+
+          // Re-anchor offset so (wx, wy) stays under (mouseX, mouseY)
+          this.offsetX = mouseX - wx * this.scale;
+          this.offsetY = mouseY + wy * this.scale;
+          this.dirty = true;
+        },
+        { passive: false },
+      );
+
+      // 2. Pointer Panning (Mouse + Touch)
+      this.canvas.addEventListener("pointerdown", (e) => {
+        this.isDragging = true;
+        this.lastPointer = { x: e.clientX, y: e.clientY };
+        this.canvas.setPointerCapture(e.pointerId);
+      });
+
+      this.canvas.addEventListener("pointermove", (e) => {
+        if (!this.isDragging) return;
+        this.offsetX += e.clientX - this.lastPointer.x;
+        this.offsetY += e.clientY - this.lastPointer.y;
+        this.lastPointer = { x: e.clientX, y: e.clientY };
+        this.dirty = true;
+      });
+
+      this.canvas.addEventListener("pointerup", (e) => {
+        this.isDragging = false;
+        this.canvas.releasePointerCapture(e.pointerId);
+      });
+    }
+
+    // Adaptive 1-2-5 grid step calculation
+    getGridStep() {
+      const targetPixelSpacing = 90;
+      const rawStep = targetPixelSpacing / this.scale;
+      const mag = Math.pow(10, Math.floor(Math.log10(rawStep)));
+      const norm = rawStep / mag;
+      if (norm >= 5) return 5 * mag;
+      if (norm >= 2) return 2 * mag;
+      return mag;
+    }
+
+    drawGrid() {
+      const { ctx, width, height } = this;
+      const step = this.getGridStep();
+      const xMin = this.toWorldX(0);
+      const xMax = this.toWorldX(width);
+      const yMax = this.toWorldY(0);
+      const yMin = this.toWorldY(height);
+
+      // Batch all minor/major grid lines into a single path
+      ctx.beginPath();
+      ctx.strokeStyle = "#e2e8f0";
+      ctx.lineWidth = 1;
+
+      const firstX = Math.floor(xMin / step) * step;
+      for (let x = firstX; x <= xMax; x += step) {
+        const px = Math.round(this.toScreenX(x)) + 0.5; // +0.5 prevents subpixel blur
+        ctx.moveTo(px, 0);
+        ctx.lineTo(px, height);
+      }
+
+      const firstY = Math.floor(yMin / step) * step;
+      for (let y = firstY; y <= yMax; y += step) {
+        const py = Math.round(this.toScreenY(y)) + 0.5;
+        ctx.moveTo(0, py);
+        ctx.lineTo(width, py);
+      }
+      ctx.stroke();
+
+      // Primary X and Y axes
+      ctx.beginPath();
+      ctx.strokeStyle = "#475569";
+      ctx.lineWidth = 1.5;
+      if (this.offsetX >= 0 && this.offsetX <= width) {
+        const ax = Math.round(this.offsetX) + 0.5;
+        ctx.moveTo(ax, 0);
+        ctx.lineTo(ax, height);
+      }
+      if (this.offsetY >= 0 && this.offsetY <= height) {
+        const ay = Math.round(this.offsetY) + 0.5;
+        ctx.moveTo(0, ay);
+        ctx.lineTo(width, ay);
+      }
+      ctx.stroke();
+
+      // Axis labels
+      ctx.fillStyle = "#64748b";
+      ctx.font = "11px system-ui, sans-serif";
+      const labelY = Math.min(Math.max(this.offsetY + 14, 14), height - 6);
+      for (let x = firstX; x <= xMax; x += step) {
+        if (Math.abs(x) < step * 1e-6) continue;
+        ctx.fillText(
+          Number(x.toPrecision(6)).toString(),
+          this.toScreenX(x) + 4,
+          labelY,
+        );
+      }
+    }
+
+    drawFunctions() {
+      const { ctx, width, height } = this;
+
+      for (const { fn, color, lineWidth } of this.functions) {
+        ctx.beginPath();
+        ctx.strokeStyle = color;
+        ctx.lineWidth = lineWidth;
+        ctx.lineJoin = "round";
+
+        let penDown = false;
+        let prevPy = 0;
+
+        // Sample exactly 1 point per CSS pixel across the visible width
+        for (let px = 0; px <= width; px += 1) {
+          const x = this.toWorldX(px);
+          const y = fn(x);
+
+          if (!Number.isFinite(y)) {
+            penDown = false;
+            continue;
+          }
+
+          const py = this.toScreenY(y);
+
+          // Break path across vertical asymptotes (e.g., tan(x), 1/x)
+          const isJump = penDown && Math.abs(py - prevPy) > height * 1.5;
+
+          if (!penDown || isJump) {
+            ctx.moveTo(px, py);
+            penDown = true;
+          } else {
+            ctx.lineTo(px, py);
+          }
+          prevPy = py;
+        }
+
+        ctx.stroke(); // Single GPU draw call per curve
+      }
+    }
+
+    render() {
+      this.ctx.fillStyle = "#ffffff";
+      this.ctx.fillRect(0, 0, this.width, this.height);
+      this.drawGrid();
+      this.drawFunctions();
+    }
+
+    loop = () => {
+      if (this.dirty) {
+        this.render();
+        this.dirty = false;
+      }
+      requestAnimationFrame(this.loop);
+    };
+  }
+
+  // Usage:
+  const graph = new HighPerfMathGraph(canvas_element);
+  graph.addFunction((x) => Math.sin(x) * Math.cos(x * 3), "#2563eb", 2);
+  graph.addFunction((x) => Math.tan(x), "#dc2626", 1.5);
+</script>
